@@ -1,6 +1,6 @@
 # memory-lancedb-pro v1.1.0 — 智能记忆增强
 
-> **日期**: 2026-03-03  
+> **日期**: 2026-03-06  
 > **作者**: CJY  
 > **概述**: 基于对 AI Agent 记忆系统的深入理解，对记忆的写入质量、生命周期管理和去重能力进行了全面改进与完善
 
@@ -26,6 +26,23 @@
 | 智能提取     | LLM 驱动的 6 类别提取 + L0/L1/L2 分层存储 | 记忆写入更精准、结构更丰富         |
 | 生命周期管理 | Weibull 衰减模型 + 三层晋升/降级          | 重要记忆持久保留，过时记忆自然淡化 |
 | 智能去重     | 向量预过滤 + LLM 语义决策                 | 避免冗余记忆，支持信息演化合并     |
+
+### 当前落地状态（2026-03-06）
+
+以下能力已接入运行主路径，而不再只是"模块存在"：
+
+- `SmartExtractor` 已挂到 `agent_end`，新写入默认产出 `memory_category`、`tier`、`l0_abstract`、`l1_overview`、`l2_content`
+- `before_agent_start` 自动召回后会回写 `access_count` 与 `last_accessed_at`
+- `src/retriever.ts` 已接入 `decayEngine.applySearchBoost()`，检索结果按生命周期分数重排
+- `tierManager` 已接入 recall 后维护流程，根据 recall 计数和 lifecycle score 回写 tier 变更
+- `memory_store`、regex fallback、迁移、session memory、upgrade 都统一写入 smart metadata
+- `openclaw.plugin.json` 已暴露 `decay` / `tier` 配置项
+- 生命周期回归测试已加入 `npm test`
+
+仍保留的兼容路径：
+
+- 当 lifecycle decay 未启用或不可用时，retriever 仍可回退到旧的 `Recency Boost → Importance Weight → Time Decay` 排序链
+- 旧格式数据仍可读取，并可通过 `openclaw memory-pro upgrade` 统一补齐 metadata
 
 ---
 
@@ -141,7 +158,18 @@ Peripheral（外围） ⟷ Working（工作） ⟷ Core（核心）
 
 ---
 
-### 7. `src/memory-upgrader.ts` — 旧记忆升级器
+### 7. `src/smart-metadata.ts` — Smart metadata 归一化辅助模块
+
+统一新老写入入口的生命周期字段，确保所有记忆路径产出一致的 metadata 结构：
+
+- 统一补齐 `memory_category`、`tier`、`l0_abstract`、`l1_overview`、`l2_content`
+- 统一处理 `access_count`、`confidence`、`last_accessed_at`
+- 将存储记录转换为 lifecycle scoring 所需的 `DecayableMemory`
+- 为迁移、upgrade、tool-store、regex fallback 提供同一套默认值与兼容逻辑
+
+---
+
+### 8. `src/memory-upgrader.ts` — 旧记忆升级器
 
 将旧格式记忆（无 L0/L1/L2 / 5 类别）批量升级为新智能记忆格式，统一生命周期管理：
 
@@ -156,6 +184,15 @@ Peripheral（外围） ⟷ Working（工作） ⟷ Core（核心）
 ## 四、修改文件
 
 ### `index.ts` — 插件入口
+
+#### 新增导入
+
+```typescript
+import { SmartExtractor } from "./src/smart-extractor.js";
+import { createLlmClient } from "./src/llm-client.js";
+import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
+import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
+```
 
 #### 新增配置项
 
@@ -181,11 +218,21 @@ extractMaxChars?: number;     // 送入 LLM 的最大字符数（默认 8000）
 - 注入的记忆上下文现在显示 L0 摘要而非原始文本
 - 新增 6 类别标签（如 `[preferences:global]`）
 - 新增层级标记（`[C]`ore / `[W]`orking / `[P]`eripheral）
+- 自动召回后回写 `access_count` 与 `last_accessed_at`
 
 #### 启动时旧记忆检测
 
 - 插件启动 5 秒后异步扫描旧格式记忆数量
 - 如发现旧格式记忆，在日志中输出提示：`Run 'openclaw memory-pro upgrade' to convert them.`
+
+### `src/retriever.ts` — 检索器
+
+- 接入 `decayEngine.applySearchBoost()`，检索结果按生命周期分数重排
+- 当 lifecycle decay 未启用或不可用时，可回退到旧的 `Recency Boost → Importance Weight → Time Decay` 排序链
+
+### `openclaw.plugin.json` — 插件配置清单
+
+- 暴露 `decay` / `tier` 配置项，允许用户自定义衰减参数和晋升阈值
 
 ### `cli.ts` — CLI 命令
 

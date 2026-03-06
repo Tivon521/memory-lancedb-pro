@@ -6,6 +6,7 @@ import type * as LanceDB from "@lancedb/lancedb";
 import { randomUUID } from "node:crypto";
 import { existsSync, accessSync, constants, mkdirSync, realpathSync, lstatSync } from "node:fs";
 import { dirname } from "node:path";
+import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
 // Types
@@ -30,6 +31,10 @@ export interface MemorySearchResult {
 export interface StoreConfig {
   dbPath: string;
   vectorDim: number;
+}
+
+export interface MetadataPatch {
+  [key: string]: unknown;
 }
 
 // ============================================================================
@@ -60,6 +65,26 @@ function clampInt(value: number, min: number, max: number): number {
 
 function escapeSqlLiteral(value: string): string {
   return value.replace(/'/g, "''");
+}
+
+function normalizeSearchText(value: string): string {
+  return value.toLowerCase().trim();
+}
+
+function scoreLexicalHit(query: string, candidates: Array<{ text: string; weight: number }>): number {
+  const normalizedQuery = normalizeSearchText(query);
+  if (!normalizedQuery) return 0;
+
+  let score = 0;
+  for (const candidate of candidates) {
+    const normalized = normalizeSearchText(candidate.text);
+    if (!normalized) continue;
+    if (normalized.includes(normalizedQuery)) {
+      score = Math.max(score, Math.min(0.95, 0.72 + normalizedQuery.length * 0.02) * candidate.weight);
+    }
+  }
+
+  return score;
 }
 
 // ============================================================================
@@ -326,6 +351,36 @@ export class MemoryStore {
     return res.length > 0;
   }
 
+  async getById(id: string, scopeFilter?: string[]): Promise<MemoryEntry | null> {
+    await this.ensureInitialized();
+
+    const safeId = escapeSqlLiteral(id);
+    const rows = await this.table!
+      .query()
+      .where(`id = '${safeId}'`)
+      .limit(1)
+      .toArray();
+
+    if (rows.length === 0) return null;
+
+    const row = rows[0];
+    const rowScope = (row.scope as string | undefined) ?? "global";
+    if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+      return null;
+    }
+
+    return {
+      id: row.id as string,
+      text: row.text as string,
+      vector: Array.from(row.vector as Iterable<number>),
+      category: row.category as MemoryEntry["category"],
+      scope: rowScope,
+      importance: Number(row.importance),
+      timestamp: Number(row.timestamp),
+      metadata: (row.metadata as string) || "{}",
+    };
+  }
+
   async vectorSearch(vector: number[], limit = 5, minScore = 0.3, scopeFilter?: string[]): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
@@ -381,11 +436,11 @@ export class MemoryStore {
   async bm25Search(query: string, limit = 5, scopeFilter?: string[]): Promise<MemorySearchResult[]> {
     await this.ensureInitialized();
 
-    if (!this.ftsIndexCreated) {
-      return []; // Fallback to vector-only if FTS unavailable
-    }
-
     const safeLimit = clampInt(limit, 1, 20);
+
+    if (!this.ftsIndexCreated) {
+      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter);
+    }
 
     try {
       // Use FTS query type explicitly
@@ -430,11 +485,73 @@ export class MemoryStore {
         });
       }
 
-      return mapped;
+      if (mapped.length > 0) {
+        return mapped;
+      }
+      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter);
     } catch (err) {
       console.warn("BM25 search failed, falling back to empty results:", err);
-      return [];
+      return this.lexicalFallbackSearch(query, safeLimit, scopeFilter);
     }
+  }
+
+  private async lexicalFallbackSearch(query: string, limit: number, scopeFilter?: string[]): Promise<MemorySearchResult[]> {
+    const trimmedQuery = query.trim();
+    if (!trimmedQuery) return [];
+
+    let searchQuery = this.table!.query().select([
+      "id",
+      "text",
+      "vector",
+      "category",
+      "scope",
+      "importance",
+      "timestamp",
+      "metadata",
+    ]);
+
+    if (scopeFilter && scopeFilter.length > 0) {
+      const scopeConditions = scopeFilter
+        .map(scope => `scope = '${escapeSqlLiteral(scope)}'`)
+        .join(" OR ");
+      searchQuery = searchQuery.where(`(${scopeConditions}) OR scope IS NULL`);
+    }
+
+    const rows = await searchQuery.toArray();
+    const matches: MemorySearchResult[] = [];
+
+    for (const row of rows) {
+      const rowScope = (row.scope as string | undefined) ?? "global";
+      if (scopeFilter && scopeFilter.length > 0 && !scopeFilter.includes(rowScope)) {
+        continue;
+      }
+
+      const entry: MemoryEntry = {
+        id: row.id as string,
+        text: row.text as string,
+        vector: row.vector as number[],
+        category: row.category as MemoryEntry["category"],
+        scope: rowScope,
+        importance: Number(row.importance),
+        timestamp: Number(row.timestamp),
+        metadata: (row.metadata as string) || "{}",
+      };
+
+      const metadata = parseSmartMetadata(entry.metadata, entry);
+      const score = scoreLexicalHit(trimmedQuery, [
+        { text: entry.text, weight: 1 },
+        { text: metadata.l0_abstract, weight: 0.98 },
+        { text: metadata.l1_overview, weight: 0.92 },
+        { text: metadata.l2_content, weight: 0.96 },
+      ]);
+
+      if (score <= 0) continue;
+      matches.push({ entry, score });
+    }
+
+    return matches
+      .sort((a, b) => b.score - a.score || b.entry.timestamp - a.entry.timestamp)
+      .slice(0, limit);
   }
 
   async delete(id: string, scopeFilter?: string[]): Promise<boolean> {
@@ -614,6 +731,22 @@ export class MemoryStore {
     await this.table!.add([updated]);
 
     return updated;
+  }
+
+  async patchMetadata(
+    id: string,
+    patch: MetadataPatch,
+    scopeFilter?: string[],
+  ): Promise<MemoryEntry | null> {
+    const existing = await this.getById(id, scopeFilter);
+    if (!existing) return null;
+
+    const metadata = buildSmartMetadata(existing, patch);
+    return this.update(
+      id,
+      { metadata: stringifySmartMetadata(metadata) },
+      scopeFilter,
+    );
   }
 
   async bulkDelete(scopeFilter: string[], beforeTimestamp?: number): Promise<number> {

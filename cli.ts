@@ -5,7 +5,7 @@
 import type { Command } from "commander";
 import { readFileSync } from "node:fs";
 import { loadLanceDB, type MemoryEntry, type MemoryStore } from "./src/store.js";
-import type { MemoryRetriever } from "./src/retriever.js";
+import { createRetriever, type MemoryRetriever } from "./src/retriever.js";
 import type { MemoryScopeManager } from "./src/scopes.js";
 import type { MemoryMigrator } from "./src/migrate.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
@@ -56,11 +56,48 @@ function formatJson(obj: any): string {
   return JSON.stringify(obj, null, 2);
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
 // ============================================================================
 // CLI Command Implementations
 // ============================================================================
 
 export function registerMemoryCLI(program: Command, context: CLIContext): void {
+  const getSearchRetriever = (): MemoryRetriever => {
+    if (!context.embedder) {
+      return context.retriever;
+    }
+    return createRetriever(context.store, context.embedder, context.retriever.getConfig());
+  };
+
+  const runSearch = async (
+    query: string,
+    limit: number,
+    scopeFilter?: string[],
+    category?: string,
+  ) => {
+    let results = await getSearchRetriever().retrieve({
+      query,
+      limit,
+      scopeFilter,
+      category,
+    });
+
+    if (results.length === 0 && context.embedder) {
+      await sleep(75);
+      results = await getSearchRetriever().retrieve({
+        query,
+        limit,
+        scopeFilter,
+        category,
+      });
+    }
+
+    return results;
+  };
+
   const memory = program
     .command("memory-pro")
     .description("Enhanced memory management commands (LanceDB Pro)");
@@ -134,12 +171,7 @@ export function registerMemoryCLI(program: Command, context: CLIContext): void {
           scopeFilter = [options.scope];
         }
 
-        const results = await context.retriever.retrieve({
-          query,
-          limit,
-          scopeFilter,
-          category: options.category,
-        });
+        const results = await runSearch(query, limit, scopeFilter, options.category);
 
         if (options.json) {
           console.log(formatJson(results));

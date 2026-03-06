@@ -6,6 +6,8 @@
 import type { MemoryStore, MemorySearchResult } from "./store.js";
 import type { Embedder } from "./embedder.js";
 import { filterNoise } from "./noise-filter.js";
+import type { DecayEngine } from "./decay-engine.js";
+import { toLifecycleMemory } from "./smart-metadata.js";
 
 // ============================================================================
 // Types & Configuration
@@ -110,6 +112,11 @@ function clampInt(value: number, min: number, max: number): number {
 function clamp01(value: number, fallback: number): number {
   if (!Number.isFinite(value)) return Number.isFinite(fallback) ? fallback : 0;
   return Math.min(1, Math.max(0, value));
+}
+
+function clamp01WithFloor(value: number, floor: number): number {
+  const safeFloor = clamp01(floor, 0);
+  return Math.max(safeFloor, clamp01(value, safeFloor));
 }
 
 // ============================================================================
@@ -264,7 +271,8 @@ export class MemoryRetriever {
   constructor(
     private store: MemoryStore,
     private embedder: Embedder,
-    private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG
+    private config: RetrievalConfig = DEFAULT_RETRIEVAL_CONFIG,
+    private decayEngine: DecayEngine | null = null,
   ) {}
 
   async retrieve(context: RetrievalContext): Promise<RetrievalResult[]> {
@@ -301,14 +309,15 @@ export class MemoryRetriever {
       },
     } as RetrievalResult));
 
-    const boosted = this.applyRecencyBoost(mapped);
-    const weighted = this.applyImportanceWeight(boosted);
+    const weighted = this.decayEngine ? mapped : this.applyImportanceWeight(this.applyRecencyBoost(mapped));
     const lengthNormalized = this.applyLengthNormalization(weighted);
-    const timeDecayed = this.applyTimeDecay(lengthNormalized);
-    const hardFiltered = timeDecayed.filter(r => r.score >= this.config.hardMinScore);
+    const hardFiltered = lengthNormalized.filter(r => r.score >= this.config.hardMinScore);
+    const lifecycleRanked = this.decayEngine
+      ? this.applyDecayBoost(hardFiltered)
+      : this.applyTimeDecay(hardFiltered);
     const denoised = this.config.filterNoise
-      ? filterNoise(hardFiltered, r => r.entry.text)
-      : hardFiltered;
+      ? filterNoise(lifecycleRanked, r => r.entry.text)
+      : lifecycleRanked;
 
     // MMR deduplication: avoid top-k filled with near-identical memories
     const deduplicated = this.applyMMRDiversity(denoised);
@@ -344,25 +353,27 @@ export class MemoryRetriever {
       ? await this.rerankResults(query, queryVector, filtered.slice(0, limit * 2))
       : filtered;
 
-    // Apply temporal re-ranking (recency boost)
-    const temporalReranked = this.applyRecencyBoost(reranked);
-
-    // Apply importance weighting
-    const importanceWeighted = this.applyImportanceWeight(temporalReranked);
+    const temporallyRanked = this.decayEngine
+      ? reranked
+      : this.applyImportanceWeight(this.applyRecencyBoost(reranked));
 
     // Apply length normalization (penalize long entries dominating via keyword density)
-    const lengthNormalized = this.applyLengthNormalization(importanceWeighted);
+    const lengthNormalized = this.applyLengthNormalization(temporallyRanked);
 
-    // Apply time decay (penalize stale entries)
-    const timeDecayed = this.applyTimeDecay(lengthNormalized);
+    // Hard minimum score cutoff should be based on semantic / lexical relevance.
+    // Lifecycle decay and time-decay are used for re-ranking, not for dropping
+    // otherwise relevant fresh memories.
+    const hardFiltered = lengthNormalized.filter(r => r.score >= this.config.hardMinScore);
 
-    // Hard minimum score cutoff (post all scoring stages)
-    const hardFiltered = timeDecayed.filter(r => r.score >= this.config.hardMinScore);
+    // Apply lifecycle-aware decay or legacy time decay after thresholding
+    const lifecycleRanked = this.decayEngine
+      ? this.applyDecayBoost(hardFiltered)
+      : this.applyTimeDecay(hardFiltered);
 
     // Filter noise
     const denoised = this.config.filterNoise
-      ? filterNoise(hardFiltered, r => r.entry.text)
-      : hardFiltered;
+      ? filterNoise(lifecycleRanked, r => r.entry.text)
+      : lifecycleRanked;
 
     // MMR deduplication: avoid top-k filled with near-identical memories
     const deduplicated = this.applyMMRDiversity(denoised);
@@ -452,6 +463,7 @@ export class MemoryRetriever {
       // Use vector similarity as the base score.
       // BM25 hit acts as a bonus (keyword match confirms relevance).
       const vectorScore = vectorResult ? vectorResult.score : 0;
+      const bm25Score = bm25Result ? bm25Result.score : 0;
       const bm25Hit = bm25Result ? 1 : 0;
 
       // Base = vector score; BM25 hit boosts by up to 15%
@@ -459,7 +471,14 @@ export class MemoryRetriever {
       // (e.g. searching "JINA_API_KEY") still surface. The previous floor of 0.5
       // was too generous and allowed ghost entries to survive hardMinScore (0.35).
       const fusedScore = vectorResult
-        ? clamp01(vectorScore + (bm25Hit * 0.15 * vectorScore), 0.1)
+        ? clamp01(
+            Math.max(
+              vectorScore + (bm25Hit * 0.15 * vectorScore),
+              (vectorScore * this.config.vectorWeight) + (bm25Score * this.config.bm25Weight),
+              bm25Score >= 0.75 ? bm25Score * 0.92 : 0,
+            ),
+            0.1,
+          )
         : clamp01(bm25Result!.score, 0.1);
 
       fusedResults.push({
@@ -526,10 +545,11 @@ export class MemoryRetriever {
               .filter(item => item.index >= 0 && item.index < results.length)
               .map(item => {
                 const original = results[item.index];
+                const floor = this.getRerankPreservationFloor(original, false);
                 // Blend: 60% cross-encoder score + 40% original fused score
-                const blendedScore = clamp01(
+                const blendedScore = clamp01WithFloor(
                   item.score * 0.6 + original.score * 0.4,
-                  original.score * 0.5,
+                  floor,
                 );
                 return {
                   ...original,
@@ -544,7 +564,13 @@ export class MemoryRetriever {
             // Keep unreturned candidates with their original scores (slightly penalized)
             const unreturned = results
               .filter((_, idx) => !returnedIndices.has(idx))
-              .map(r => ({ ...r, score: r.score * 0.8 }));
+              .map(r => ({
+                ...r,
+                score: clamp01WithFloor(
+                  r.score * 0.8,
+                  this.getRerankPreservationFloor(r, true),
+                ),
+              }));
 
             return [...reranked, ...unreturned].sort((a, b) => b.score - a.score);
           }
@@ -582,6 +608,20 @@ export class MemoryRetriever {
       console.warn("Reranking failed, returning original results:", error);
       return results;
     }
+  }
+
+  private getRerankPreservationFloor(result: RetrievalResult, unreturned: boolean): number {
+    const bm25Score = result.sources.bm25?.score ?? 0;
+
+    // Exact lexical hits (IDs, env vars, ticket numbers) should not disappear
+    // just because a reranker under-scores symbolic or mixed-language queries.
+    if (bm25Score >= 0.75) {
+      return result.score * (unreturned ? 1.0 : 0.95);
+    }
+    if (bm25Score >= 0.6) {
+      return result.score * (unreturned ? 0.95 : 0.9);
+    }
+    return result.score * (unreturned ? 0.8 : 0.5);
   }
 
   /**
@@ -628,6 +668,24 @@ export class MemoryRetriever {
       };
     });
     return weighted.sort((a, b) => b.score - a.score);
+  }
+
+  private applyDecayBoost(results: RetrievalResult[]): RetrievalResult[] {
+    if (!this.decayEngine || results.length === 0) return results;
+
+    const scored = results.map((result) => ({
+      memory: toLifecycleMemory(result.entry.id, result.entry),
+      score: result.score,
+    }));
+
+    this.decayEngine.applySearchBoost(scored);
+
+    const reranked = results.map((result, index) => ({
+      ...result,
+      score: clamp01(scored[index].score, result.score * 0.3),
+    }));
+
+    return reranked.sort((a, b) => b.score - a.score);
   }
 
   /**
@@ -778,8 +836,9 @@ export class MemoryRetriever {
 export function createRetriever(
   store: MemoryStore,
   embedder: Embedder,
-  config?: Partial<RetrievalConfig>
+  config?: Partial<RetrievalConfig>,
+  options?: { decayEngine?: DecayEngine | null },
 ): MemoryRetriever {
   const fullConfig = { ...DEFAULT_RETRIEVAL_CONFIG, ...config };
-  return new MemoryRetriever(store, embedder, fullConfig);
+  return new MemoryRetriever(store, embedder, fullConfig, options?.decayEngine ?? null);
 }

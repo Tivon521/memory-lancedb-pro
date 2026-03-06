@@ -17,6 +17,7 @@ import type { MemoryStore, MemoryEntry } from "./store.js";
 import type { LlmClient } from "./llm-client.js";
 import type { MemoryCategory } from "./memory-categories.js";
 import type { MemoryTier } from "./memory-categories.js";
+import { buildSmartMetadata, stringifySmartMetadata } from "./smart-metadata.js";
 
 // ============================================================================
 // Types
@@ -56,6 +57,7 @@ interface EnrichedMetadata {
   tier: MemoryTier;
   access_count: number;
   confidence: number;
+  last_accessed_at: number;
   upgraded_from: string; // original 5-category
   upgraded_at: number;   // timestamp of upgrade
 }
@@ -347,14 +349,18 @@ export class MemoryUpgrader {
     })() : {};
 
     const newMetadata: EnrichedMetadata = {
-      ...existingMeta,
-      l0_abstract: enriched.l0_abstract,
-      l1_overview: enriched.l1_overview,
-      l2_content: enriched.l2_content,
-      memory_category: newCategory,
-      tier: "working" as MemoryTier,
-      access_count: 0,
-      confidence: 0.7,
+      ...buildSmartMetadata(
+        { ...entry, metadata: JSON.stringify(existingMeta) },
+        {
+          l0_abstract: enriched.l0_abstract,
+          l1_overview: enriched.l1_overview,
+          l2_content: enriched.l2_content,
+          memory_category: newCategory,
+          tier: "working" as MemoryTier,
+          access_count: 0,
+          confidence: 0.7,
+        },
+      ),
       upgraded_from: entry.category,
       upgraded_at: Date.now(),
     };
@@ -363,7 +369,7 @@ export class MemoryUpgrader {
     await this.store.update(entry.id, {
       // Update text to L0 abstract for better search indexing
       text: enriched.l0_abstract,
-      metadata: JSON.stringify(newMetadata),
+      metadata: stringifySmartMetadata(newMetadata),
     });
   }
 }

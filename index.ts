@@ -18,6 +18,7 @@ import { createMigrator } from "./src/migrate.js";
 import { registerAllMemoryTools } from "./src/tools.js";
 import { shouldSkipRetrieval } from "./src/adaptive-retrieval.js";
 import { createMemoryCLI } from "./cli.js";
+import { isNoise } from "./src/noise-filter.js";
 
 // Import smart extraction & lifecycle components
 import { SmartExtractor } from "./src/smart-extractor.js";
@@ -25,6 +26,12 @@ import { createLlmClient } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
 import { createMemoryUpgrader } from "./src/memory-upgrader.js";
+import {
+  buildSmartMetadata,
+  parseSmartMetadata,
+  stringifySmartMetadata,
+  toLifecycleMemory,
+} from "./src/smart-metadata.js";
 
 // ============================================================================
 // Configuration & Types
@@ -64,7 +71,31 @@ interface PluginConfig {
     hardMinScore?: number;
     timeDecayHalfLifeDays?: number;
   };
-  // Smart extraction config (Phase 1: from epro-memory)
+  decay?: {
+    recencyHalfLifeDays?: number;
+    recencyWeight?: number;
+    frequencyWeight?: number;
+    intrinsicWeight?: number;
+    staleThreshold?: number;
+    searchBoostMin?: number;
+    importanceModulation?: number;
+    betaCore?: number;
+    betaWorking?: number;
+    betaPeripheral?: number;
+    coreDecayFloor?: number;
+    workingDecayFloor?: number;
+    peripheralDecayFloor?: number;
+  };
+  tier?: {
+    coreAccessThreshold?: number;
+    coreCompositeThreshold?: number;
+    coreImportanceThreshold?: number;
+    peripheralCompositeThreshold?: number;
+    peripheralAgeDays?: number;
+    workingAccessThreshold?: number;
+    workingCompositeThreshold?: number;
+  };
+  // Smart extraction config
   smartExtraction?: boolean;
   llm?: {
     apiKey?: string;
@@ -113,6 +144,19 @@ function parsePositiveInt(value: unknown): number | undefined {
     if (Number.isFinite(n) && n > 0) return Math.floor(n);
   }
   return undefined;
+}
+
+function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) return undefined;
+  const m = /^agent:([^:]+):/.exec(sessionKey);
+  return m?.[1];
+}
+
+function resolveHookAgentId(
+  explicitAgentId: string | undefined,
+  sessionKey: string | undefined,
+): string {
+  return explicitAgentId || parseAgentIdFromSessionKey(sessionKey) || "main";
 }
 
 // ============================================================================
@@ -360,14 +404,28 @@ const memoryLanceDBProPlugin = {
       taskPassage: config.embedding.taskPassage,
       normalized: config.embedding.normalized,
     });
-    const retriever = createRetriever(store, embedder, {
-      ...DEFAULT_RETRIEVAL_CONFIG,
-      ...config.retrieval,
+    // Initialize decay engine
+    const decayEngine = createDecayEngine({
+      ...DEFAULT_DECAY_CONFIG,
+      ...(config.decay || {}),
     });
+    const tierManager = createTierManager({
+      ...DEFAULT_TIER_CONFIG,
+      ...(config.tier || {}),
+    });
+    const retriever = createRetriever(
+      store,
+      embedder,
+      {
+        ...DEFAULT_RETRIEVAL_CONFIG,
+        ...config.retrieval,
+      },
+      { decayEngine },
+    );
     const scopeManager = createScopeManager(config.scopes);
     const migrator = createMigrator(store);
 
-    // Initialize smart extraction (Phase 1: from epro-memory)
+    // Initialize smart extraction
     let smartExtractor: SmartExtractor | null = null;
     if (config.smartExtraction !== false) {
       try {
@@ -377,7 +435,7 @@ const memoryLanceDBProPlugin = {
         const llmBaseURL = config.llm?.baseURL
           ? resolveEnvVars(config.llm.baseURL)
           : config.embedding.baseURL;
-        const llmModel = config.llm?.model || "gpt-4o-mini";
+        const llmModel = config.llm?.model || "openai/gpt-oss-120b";
 
         const llmClient = createLlmClient({
           apiKey: llmApiKey,
@@ -400,9 +458,105 @@ const memoryLanceDBProPlugin = {
       }
     }
 
-    // Initialize decay engine (Phase 2: from memx-memory)
-    const decayEngine = createDecayEngine(DEFAULT_DECAY_CONFIG);
-    const tierManager = createTierManager(DEFAULT_TIER_CONFIG);
+    async function sleep(ms: number): Promise<void> {
+      await new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function retrieveWithRetry(params: {
+      query: string;
+      limit: number;
+      scopeFilter?: string[];
+      category?: string;
+    }) {
+      let results = await retriever.retrieve(params);
+      if (results.length === 0) {
+        await sleep(75);
+        results = await retriever.retrieve(params);
+      }
+      return results;
+    }
+
+    async function runRecallLifecycle(
+      results: Array<{ entry: { id: string; text: string; category: "preference" | "fact" | "decision" | "entity" | "other"; scope: string; importance: number; timestamp: number; metadata?: string } }>,
+      scopeFilter: string[],
+    ): Promise<Map<string, string>> {
+      const now = Date.now();
+      type LifecycleEntry = {
+        id: string;
+        text: string;
+        category: "preference" | "fact" | "decision" | "entity" | "other";
+        scope: string;
+        importance: number;
+        timestamp: number;
+        metadata?: string;
+      };
+      const lifecycleEntries = new Map<string, LifecycleEntry>();
+      const tierOverrides = new Map<string, string>();
+
+      await Promise.allSettled(
+        results.map(async (result) => {
+          const metadata = parseSmartMetadata(result.entry.metadata, result.entry);
+          const updated = await store.patchMetadata(
+            result.entry.id,
+            {
+              access_count: metadata.access_count + 1,
+              last_accessed_at: now,
+            },
+            scopeFilter,
+          );
+          lifecycleEntries.set(result.entry.id, updated ?? result.entry);
+        }),
+      );
+
+      try {
+        const recentEntries = await store.list(scopeFilter, undefined, 100, 0);
+        for (const entry of recentEntries) {
+          if (!lifecycleEntries.has(entry.id)) {
+            lifecycleEntries.set(entry.id, entry);
+          }
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: tier maintenance preload failed: ${String(err)}`);
+      }
+
+      const candidates = Array.from(lifecycleEntries.values())
+        .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry))
+        .filter((entry) => parseSmartMetadata(entry.metadata, entry).type !== "session-summary");
+
+      if (candidates.length === 0) {
+        return tierOverrides;
+      }
+
+      try {
+        const memories = candidates.map((entry) => toLifecycleMemory(entry.id, entry));
+        const decayScores = decayEngine.scoreAll(memories, now);
+        const transitions = tierManager.evaluateAll(memories, decayScores, now);
+
+        await Promise.allSettled(
+          transitions.map(async (transition) => {
+            await store.patchMetadata(
+              transition.memoryId,
+              {
+                tier: transition.toTier,
+                tier_updated_at: now,
+              },
+              scopeFilter,
+            );
+            tierOverrides.set(transition.memoryId, transition.toTier);
+          }),
+        );
+
+        if (transitions.length > 0) {
+          api.logger.info(
+            `memory-lancedb-pro: tier maintenance applied ${transitions.length} transition(s)`,
+          );
+        }
+      } catch (err) {
+        api.logger.warn(`memory-lancedb-pro: tier maintenance failed: ${String(err)}`);
+      }
+
+      return tierOverrides;
+    }
 
     const pluginVersion = getPluginVersion();
 
@@ -449,7 +603,7 @@ const memoryLanceDBProPlugin = {
               : config.embedding.baseURL;
             return createLlmClient({
               apiKey: llmApiKey,
-              model: config.llm?.model || "gpt-4o-mini",
+              model: config.llm?.model || "openai/gpt-oss-120b",
               baseURL: llmBaseURL,
               timeoutMs: 30000,
             });
@@ -473,10 +627,10 @@ const memoryLanceDBProPlugin = {
 
         try {
           // Determine agent ID and accessible scopes
-          const agentId = ctx?.agentId || "main";
+          const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
 
-          const results = await retriever.retrieve({
+          const results = await retrieveWithRetry({
             query: event.prompt,
             limit: 3,
             scopeFilter: accessibleScopes,
@@ -486,15 +640,16 @@ const memoryLanceDBProPlugin = {
             return;
           }
 
+          const tierOverrides = await runRecallLifecycle(results, accessibleScopes);
+
           // Format with L0 abstracts grouped by category when available
           const memoryContext = results
             .map((r) => {
-              let metaObj: Record<string, unknown> = {};
-              try { metaObj = JSON.parse(r.entry.metadata || "{}"); } catch {}
-              const displayCategory = (metaObj.memory_category as string) || r.entry.category;
-              const displayTier = (metaObj.tier as string) || "";
+              const metaObj = parseSmartMetadata(r.entry.metadata, r.entry);
+              const displayCategory = metaObj.memory_category || r.entry.category;
+              const displayTier = tierOverrides.get(r.entry.id) || metaObj.tier || "";
               const tierPrefix = displayTier ? `[${displayTier.charAt(0).toUpperCase()}]` : "";
-              const abstract = (metaObj.l0_abstract as string) || r.entry.text;
+              const abstract = metaObj.l0_abstract || r.entry.text;
               return `- ${tierPrefix}[${displayCategory}:${r.entry.scope}] ${sanitizeForContext(abstract)} (${(r.score * 100).toFixed(0)}%${r.sources?.bm25 ? ', vector+BM25' : ''}${r.sources?.reranked ? '+reranked' : ''})`;
             })
             .join("\n");
@@ -526,7 +681,8 @@ const memoryLanceDBProPlugin = {
 
         try {
           // Determine agent ID and default scope
-          const agentId = ctx?.agentId || "main";
+          const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
+          const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
           const defaultScope = scopeManager.getDefaultScope(agentId);
 
           // Extract text content from messages
@@ -576,6 +732,7 @@ const memoryLanceDBProPlugin = {
               const sessionKey = (event as any).sessionKey || "unknown";
               const stats = await smartExtractor.extractAndPersist(
                 conversationText, sessionKey,
+                { scope: defaultScope, scopeFilter: accessibleScopes },
               );
               if (stats.created > 0 || stats.merged > 0) {
                 api.logger.info(
@@ -589,7 +746,7 @@ const memoryLanceDBProPlugin = {
           // ----------------------------------------------------------------
           // Fallback: regex-triggered capture (original logic)
           // ----------------------------------------------------------------
-          const toCapture = texts.filter((text) => text && shouldCapture(text));
+          const toCapture = texts.filter((text) => text && shouldCapture(text) && !isNoise(text));
           if (toCapture.length === 0) {
             return;
           }
@@ -613,6 +770,21 @@ const memoryLanceDBProPlugin = {
               importance: 0.7,
               category,
               scope: defaultScope,
+              metadata: stringifySmartMetadata(
+                buildSmartMetadata(
+                  {
+                    text,
+                    category,
+                    importance: 0.7,
+                  },
+                  {
+                    l0_abstract: text,
+                    l1_overview: `- ${text}`,
+                    l2_content: text,
+                    source_session: (event as any).sessionKey || "unknown",
+                  },
+                ),
+              ),
             });
             stored++;
           }
@@ -629,7 +801,7 @@ const memoryLanceDBProPlugin = {
     }
 
     // ========================================================================
-    // Session Memory Hook (replaces built-in session-memory)
+    // Session Memory Hook (runs alongside built-in session-memory unless that hook is disabled)
     // ========================================================================
 
     if (config.sessionMemory?.enabled === true) {
@@ -644,6 +816,11 @@ const memoryLanceDBProPlugin = {
           api.logger.debug("session-memory: hook triggered for /new command");
 
           const context = (event.context || {}) as Record<string, unknown>;
+          const agentId = resolveHookAgentId(
+            (event.agentId as string) || (context.agentId as string) || undefined,
+            (event.sessionKey as string) || (context.sessionKey as string) || undefined,
+          );
+          const defaultScope = scopeManager.getDefaultScope(agentId);
           const sessionEntry = (context.previousSessionEntry || context.sessionEntry || {}) as Record<string, unknown>;
           const currentSessionId = sessionEntry.sessionId as string | undefined;
           let currentSessionFile = (sessionEntry.sessionFile as string) || undefined;
@@ -700,23 +877,46 @@ const memoryLanceDBProPlugin = {
             text: memoryText,
             vector,
             category: "fact",
-            scope: "global",
+            scope: defaultScope,
             importance: 0.5,
-            metadata: JSON.stringify({
-              type: "session-summary",
-              sessionKey: event.sessionKey,
-              sessionId: currentSessionId || "unknown",
-              date: dateStr,
-            }),
+            metadata: stringifySmartMetadata(
+              buildSmartMetadata(
+                {
+                  text: `Session summary for ${dateStr}`,
+                  category: "fact",
+                  importance: 0.5,
+                  timestamp: Date.now(),
+                },
+                {
+                  l0_abstract: `Session summary for ${dateStr}`,
+                  l1_overview: `- Session summary saved for ${currentSessionId || "unknown"}`,
+                  l2_content: memoryText,
+                  memory_category: "patterns",
+                  tier: "peripheral",
+                  confidence: 0.5,
+                  type: "session-summary",
+                  sessionKey: event.sessionKey,
+                  sessionId: currentSessionId || "unknown",
+                  date: dateStr,
+                  agentId,
+                  scope: defaultScope,
+                },
+              ),
+            ),
           });
 
-          api.logger.info(`session-memory: stored session summary for ${currentSessionId || "unknown"}`);
+          api.logger.info(
+            `session-memory: stored session summary for ${currentSessionId || "unknown"} (agent: ${agentId}, scope: ${defaultScope})`
+          );
         } catch (err) {
           api.logger.warn(`session-memory: failed to save: ${String(err)}`);
         }
+      }, {
+        name: "memory-lancedb-pro-session-memory",
+        description: "Store /new session summaries in LanceDB memory",
       });
 
-      api.logger.info("session-memory: hook registered for command:new");
+      api.logger.info("session-memory: hook registered for command:new as memory-lancedb-pro-session-memory");
     }
 
     // ========================================================================
@@ -886,6 +1086,8 @@ function parsePluginConfig(value: unknown): PluginConfig {
     autoRecallMinLength: parsePositiveInt(cfg.autoRecallMinLength),
     captureAssistant: cfg.captureAssistant === true,
     retrieval: typeof cfg.retrieval === "object" && cfg.retrieval !== null ? cfg.retrieval as any : undefined,
+    decay: typeof cfg.decay === "object" && cfg.decay !== null ? cfg.decay as any : undefined,
+    tier: typeof cfg.tier === "object" && cfg.tier !== null ? cfg.tier as any : undefined,
     // Smart extraction config (Phase 1)
     smartExtraction: cfg.smartExtraction !== false, // Default ON
     llm: typeof cfg.llm === "object" && cfg.llm !== null ? cfg.llm as any : undefined,
