@@ -41,6 +41,7 @@ import { isNoise } from "./src/noise-filter.js";
 
 // Import smart extraction & lifecycle components
 import { SmartExtractor } from "./src/smart-extractor.js";
+import { NoisePrototypeBank } from "./src/noise-prototypes.js";
 import { createLlmClient } from "./src/llm-client.js";
 import { createDecayEngine, DEFAULT_DECAY_CONFIG } from "./src/decay-engine.js";
 import { createTierManager, DEFAULT_TIER_CONFIG } from "./src/tier-manager.js";
@@ -1656,6 +1657,14 @@ const memoryLanceDBProPlugin = {
           log: (msg: string) => api.logger.debug(msg),
         });
 
+        // Initialize embedding-based noise prototype bank (async, non-blocking)
+        const noiseBank = new NoisePrototypeBank(
+          (msg: string) => api.logger.debug(msg),
+        );
+        noiseBank.init(embedder).catch((err) =>
+          api.logger.debug(`memory-lancedb-pro: noise bank init: ${String(err)}`),
+        );
+
         smartExtractor = new SmartExtractor(store, embedder, llmClient, {
           user: "User",
           extractMinMessages: config.extractMinMessages ?? 2,
@@ -1663,9 +1672,10 @@ const memoryLanceDBProPlugin = {
           defaultScope: config.scopes?.default ?? "global",
           log: (msg: string) => api.logger.info(msg),
           debugLog: (msg: string) => api.logger.debug(msg),
+          noiseBank,
         });
 
-        api.logger.info("memory-lancedb-pro: smart extraction enabled (LLM model: " + llmModel + ")");
+        api.logger.info("memory-lancedb-pro: smart extraction enabled (LLM model: " + llmModel + ", noise bank: ON)");
       } catch (err) {
         api.logger.warn(`memory-lancedb-pro: smart extraction init failed, falling back to regex: ${String(err)}`);
       }
@@ -2210,11 +2220,19 @@ const memoryLanceDBProPlugin = {
           // Smart Extraction (Phase 1: LLM-powered 6-category extraction)
           // ----------------------------------------------------------------
           if (smartExtractor) {
-            if (texts.length >= minMessages) {
+            // Pre-filter: embedding-based noise detection (language-agnostic)
+            const cleanTexts = await smartExtractor.filterNoiseByEmbedding(texts);
+            if (cleanTexts.length === 0) {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${texts.length} >= ${minMessages})`,
+                `memory-lancedb-pro: all texts filtered as embedding noise for agent ${agentId}`,
               );
-              const conversationText = texts.join("\n");
+              return;
+            }
+            if (cleanTexts.length >= minMessages) {
+              api.logger.debug(
+                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${minMessages})`,
+              );
+              const conversationText = cleanTexts.join("\n");
               const stats = await smartExtractor.extractAndPersist(
                 conversationText, sessionKey,
                 { scope: defaultScope, scopeFilter: accessibleScopes },
@@ -2231,7 +2249,7 @@ const memoryLanceDBProPlugin = {
               );
             } else {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${texts.length} < ${minMessages})`,
+                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${cleanTexts.length} < ${minMessages})`,
               );
             }
           }
