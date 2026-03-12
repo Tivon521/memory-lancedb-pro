@@ -40,6 +40,7 @@ import { buildSmartMetadata, parseSmartMetadata, stringifySmartMetadata, parseSu
 // ============================================================================
 
 const SIMILARITY_THRESHOLD = 0.7;
+const SAME_TURN_MEMORY_STORE_SIMILARITY_THRESHOLD = 0.95;
 const MAX_SIMILAR_FOR_PROMPT = 3;
 const MAX_MEMORIES_PER_EXTRACTION = 5;
 const REJECTION_AUDIT_EXCERPT_CHARS = 1200;
@@ -385,7 +386,12 @@ export class SmartExtractor {
     }
 
     // Dedup pipeline
-    const dedupResult = await this.deduplicate(candidate, vector, scopeFilter);
+    const dedupResult = await this.deduplicate(
+      candidate,
+      vector,
+      sessionKey,
+      scopeFilter,
+    );
 
     switch (dedupResult.decision) {
       case "create":
@@ -489,6 +495,7 @@ export class SmartExtractor {
   private async deduplicate(
     candidate: CandidateMemory,
     candidateVector: number[],
+    sessionKey: string,
     scopeFilter: string[],
   ): Promise<DedupResult> {
     // Stage 1: Vector pre-filter — find similar memories
@@ -503,8 +510,40 @@ export class SmartExtractor {
       return { decision: "create", reason: "No similar memories found" };
     }
 
+    const sameTurnToolMatch = this.findSameTurnMemoryStoreMatch(
+      candidate,
+      similar,
+      sessionKey,
+    );
+    if (sameTurnToolMatch) {
+      return {
+        decision: "skip",
+        reason: `Same-turn memory_store duplicate (${sameTurnToolMatch.score.toFixed(3)})`,
+        matchId: sameTurnToolMatch.entry.id,
+      };
+    }
+
     // Stage 2: LLM decision
     return this.llmDedupDecision(candidate, similar);
+  }
+
+  private findSameTurnMemoryStoreMatch(
+    candidate: CandidateMemory,
+    similar: MemorySearchResult[],
+    sessionKey: string,
+  ): MemorySearchResult | null {
+    for (const match of similar) {
+      const meta = parseSmartMetadata(match.entry.metadata, match.entry);
+      if (
+        meta.source_session === sessionKey &&
+        meta.memory_category === candidate.category &&
+        meta.write_path === "memory_store" &&
+        match.score >= SAME_TURN_MEMORY_STORE_SIMILARITY_THRESHOLD
+      ) {
+        return match;
+      }
+    }
+    return null;
   }
 
   private async llmDedupDecision(

@@ -309,6 +309,264 @@ assert.ok(
   skipResult.logs.some((entry) => entry[1].includes("smart-extractor: skipped [preferences]")),
 );
 
+async function runExplicitRememberSkipScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-explicit-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  let llmCalls = 0;
+  const embeddingServer = createEmbeddingServer();
+
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const prompt = payload.messages?.[1]?.content || "";
+    llmCalls += 1;
+
+    let content;
+    if (prompt.includes("Analyze the following session context")) {
+      content = JSON.stringify({
+        memories: [
+          {
+            category: "preferences",
+            abstract: "饮品偏好：乌龙茶",
+            overview: "## Preference Domain\n- 饮品\n\n## Details\n- 喜欢乌龙茶",
+            content: "用户长期喜欢乌龙茶。",
+          },
+        ],
+      });
+    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+      content = JSON.stringify({
+        decision: "skip",
+        match_index: 1,
+        reason: "Candidate fully duplicates existing preference memory",
+      });
+    } else {
+      content = JSON.stringify({ memories: [] });
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "mock-memory-model",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        },
+      ],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const port = server.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${port}`,
+      logs,
+    );
+    plugin.register(api);
+    await seedPreference(dbPath);
+
+    await api.hooks.agent_end(
+      {
+        success: true,
+        sessionKey: "agent:life:test",
+        messages: [
+          {
+            role: "user",
+            content: "[Thu 2026-03-12 08:13 PDT] 验收标记 ORBIT-GLASS-TEST：你记住，我长期更喜欢乌龙茶。",
+          },
+        ],
+      },
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+
+    const freshStore = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await freshStore.list(["agent:life"], undefined, 10, 0);
+    return { entries, llmCalls, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const explicitRememberSkipResult = await runExplicitRememberSkipScenario();
+assert.equal(explicitRememberSkipResult.entries.length, 1);
+assert.equal(explicitRememberSkipResult.entries[0].text, "饮品偏好：乌龙茶");
+assert.equal(explicitRememberSkipResult.llmCalls, 2);
+assert.ok(
+  explicitRememberSkipResult.logs.some((entry) =>
+    entry[1].includes("auto-capture running smart extraction for agent life (1 clean texts >= 1)")
+  ),
+);
+assert.ok(
+  explicitRememberSkipResult.logs.some((entry) => entry[1].includes("smart-extractor: skipped [preferences]")),
+);
+assert.ok(
+  explicitRememberSkipResult.logs.every((entry) => !entry[1].includes("regex fallback found 1 capturable text(s)")),
+);
+
+async function runSameTurnMemoryStoreSkipScenario() {
+  const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-same-turn-tool-"));
+  const dbPath = path.join(workDir, "db");
+  const logs = [];
+  let llmCalls = 0;
+  const embeddingServer = createEmbeddingServer();
+
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== "POST" || req.url !== "/chat/completions") {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const prompt = payload.messages?.[1]?.content || "";
+    llmCalls += 1;
+
+    let content;
+    if (prompt.includes("Analyze the following session context")) {
+      content = JSON.stringify({
+        memories: [
+          {
+            category: "preferences",
+            abstract: "饮品偏好：桂花龙井茶",
+            overview: "## Preference Domain\n- 饮品\n\n## Details\n- 喜欢桂花龙井茶\n- 不喜欢雪碧",
+            content: "用户长期喜欢桂花龙井茶，不喜欢雪碧。",
+          },
+        ],
+      });
+    } else if (prompt.includes("Determine how to handle this candidate memory")) {
+      content = "not-json";
+    } else {
+      content = JSON.stringify({ memories: [] });
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: "mock-memory-model",
+      choices: [
+        {
+          index: 0,
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        },
+      ],
+    }));
+  });
+
+  await new Promise((resolve) => embeddingServer.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const embeddingPort = embeddingServer.address().port;
+  const port = server.address().port;
+  process.env.TEST_EMBEDDING_BASE_URL = `http://127.0.0.1:${embeddingPort}/v1`;
+
+  try {
+    const api = createMockApi(
+      dbPath,
+      `http://127.0.0.1:${embeddingPort}/v1`,
+      `http://127.0.0.1:${port}`,
+      logs,
+    );
+    plugin.register(api);
+
+    const memoryStoreTool = api.toolFactories.memory_store({
+      agentId: "life",
+      sessionKey: "agent:life:test",
+    });
+
+    const toolResult = await memoryStoreTool.execute(
+      "call-memory-store",
+      {
+        text: "Master长期偏好：喜欢桂花龙井茶，不喜欢雪碧。",
+        importance: 0.85,
+        category: "preference",
+        scope: "agent:life",
+      },
+      undefined,
+      undefined,
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+
+    assert.equal(toolResult.details.action, "created");
+
+    await api.hooks.agent_end(
+      {
+        success: true,
+        sessionKey: "agent:life:test",
+        messages: [
+          {
+            role: "user",
+            content: "[Thu 2026-03-12 08:18 PDT] 验收标记 ORBIT-GLASS-SAME-TURN：你记住，我长期更喜欢桂花龙井茶，不喜欢雪碧。",
+          },
+        ],
+      },
+      { agentId: "life", sessionKey: "agent:life:test" },
+    );
+
+    const freshStore = new MemoryStore({ dbPath, vectorDim: EMBEDDING_DIMENSIONS });
+    const entries = await freshStore.list(["agent:life"], undefined, 10, 0);
+    return { entries, llmCalls, logs };
+  } finally {
+    delete process.env.TEST_EMBEDDING_BASE_URL;
+    await new Promise((resolve) => embeddingServer.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+const sameTurnMemoryStoreSkipResult = await runSameTurnMemoryStoreSkipScenario();
+assert.equal(sameTurnMemoryStoreSkipResult.entries.length, 1);
+assert.equal(
+  sameTurnMemoryStoreSkipResult.entries[0].text,
+  "Master长期偏好：喜欢桂花龙井茶，不喜欢雪碧。",
+);
+assert.equal(sameTurnMemoryStoreSkipResult.llmCalls, 1);
+assert.ok(
+  sameTurnMemoryStoreSkipResult.entries[0].metadata.includes("\"source_session\":\"agent:life:test\""),
+);
+assert.ok(
+  sameTurnMemoryStoreSkipResult.entries[0].metadata.includes("\"write_path\":\"memory_store\""),
+);
+assert.ok(
+  sameTurnMemoryStoreSkipResult.logs.some((entry) =>
+    entry[1].includes("smart-extractor: skipped [preferences]")
+  ),
+);
+assert.ok(
+  sameTurnMemoryStoreSkipResult.logs.every((entry) =>
+    !entry[1].includes("dedup LLM returned unparseable response")
+  ),
+);
+assert.ok(
+  sameTurnMemoryStoreSkipResult.logs.every((entry) =>
+    !entry[1].includes("regex fallback found 1 capturable text(s)")
+  ),
+);
+
 async function runMultiRoundScenario() {
   const workDir = mkdtempSync(path.join(tmpdir(), "memory-smart-rounds-"));
   const dbPath = path.join(workDir, "db");
@@ -658,12 +916,17 @@ async function runPrependedRecallWithUserTextScenario() {
 }
 
 const prependedRecallResult = await runPrependedRecallWithUserTextScenario();
-assert.equal(prependedRecallResult.llmCalls, 0);
+assert.equal(prependedRecallResult.llmCalls, 1);
 assert.ok(
   prependedRecallResult.logs.some((entry) => entry[1].includes("auto-capture collected 1 text(s)")),
 );
 assert.ok(
   prependedRecallResult.logs.some((entry) => entry[1].includes("preview=\"请记住我的饮品偏好是乌龙茶。\"")),
+);
+assert.ok(
+  prependedRecallResult.logs.some((entry) =>
+    entry[1].includes("auto-capture running smart extraction for agent life (1 clean texts >= 1)")
+  ),
 );
 assert.ok(
   prependedRecallResult.logs.some((entry) => entry[1].includes("regex fallback found 1 capturable text(s)")),
@@ -747,10 +1010,15 @@ async function runInboundMetadataWrappedScenario() {
 }
 
 const inboundMetadataWrappedResult = await runInboundMetadataWrappedScenario();
-assert.equal(inboundMetadataWrappedResult.llmCalls, 0);
+assert.equal(inboundMetadataWrappedResult.llmCalls, 1);
 assert.ok(
   inboundMetadataWrappedResult.logs.some((entry) =>
     entry[1].includes('preview="请记住我的饮品偏好是乌龙茶"')
+  ),
+);
+assert.ok(
+  inboundMetadataWrappedResult.logs.some((entry) =>
+    entry[1].includes("auto-capture running smart extraction for agent life (1 clean texts >= 1)")
   ),
 );
 assert.ok(

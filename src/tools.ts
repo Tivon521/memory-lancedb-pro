@@ -108,6 +108,14 @@ function resolveRuntimeAgentId(
   return ctxAgentId || parseAgentIdFromSessionKey(ctxSessionKey) || staticAgentId;
 }
 
+function resolveRuntimeSessionKey(runtimeCtx: unknown): string | undefined {
+  if (!runtimeCtx || typeof runtimeCtx !== "object") return undefined;
+  const ctx = runtimeCtx as Record<string, unknown>;
+  const sessionKey =
+    typeof ctx.sessionKey === "string" ? ctx.sessionKey.trim() : "";
+  return sessionKey || undefined;
+}
+
 function resolveToolContext(
   base: ToolContext,
   runtimeCtx: unknown,
@@ -547,7 +555,7 @@ export function registerMemoryStoreTool(
           }),
         ),
       }),
-      async execute(_toolCallId, params) {
+      async execute(_toolCallId, params, _signal, _onUpdate, runtimeCtx) {
         const {
           text,
           importance = 0.7,
@@ -561,7 +569,13 @@ export function registerMemoryStoreTool(
         };
 
         try {
-          const agentId = runtimeContext.agentId;
+          const agentId =
+            resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx) ||
+            runtimeContext.agentId;
+          const sourceSession =
+            resolveRuntimeSessionKey(runtimeCtx) ||
+            resolveRuntimeSessionKey(toolCtx) ||
+            "unknown";
           // Determine target scope
           let targetScope = scope || runtimeContext.scopeManager.getDefaultScope(agentId);
 
@@ -645,6 +659,8 @@ export function registerMemoryStoreTool(
                   l0_abstract: text,
                   l1_overview: `- ${text}`,
                   l2_content: text,
+                  source_session: sourceSession,
+                  write_path: "memory_store",
                 },
               ),
             ),

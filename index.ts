@@ -671,6 +671,8 @@ const AUTO_CAPTURE_ADDRESSING_PREFIX_RE = /^(?:<@!?[0-9]+>|@[A-Za-z0-9_.-]+)\s*/
 const AUTO_CAPTURE_MAP_MAX_ENTRIES = 2000;
 const AUTO_CAPTURE_EXPLICIT_REMEMBER_RE =
   /^(?:请|請)?(?:记住|記住|记一下|記一下|别忘了|別忘了)[。.!?？!]*$/u;
+const AUTO_CAPTURE_EXPLICIT_REMEMBER_INSTRUCTION_RE =
+  /(?:^|[：:\]\s])(?:(?:你|您|请|請)\s*)?(?:记住|記住|记一下|記一下|别忘了|別忘了)(?!了|嗎|吗|\?)/u;
 
 function isAutoCaptureInboundMetaSentinelLine(line: string): boolean {
   const trimmed = line.trim();
@@ -753,6 +755,13 @@ function stripAutoCaptureAddressingPrefix(text: string): string {
 
 function isExplicitRememberCommand(text: string): boolean {
   return AUTO_CAPTURE_EXPLICIT_REMEMBER_RE.test(text.trim());
+}
+
+function hasExplicitRememberInstruction(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (isExplicitRememberCommand(trimmed)) return true;
+  return AUTO_CAPTURE_EXPLICIT_REMEMBER_INSTRUCTION_RE.test(trimmed);
 }
 
 function buildAutoCaptureConversationKeyFromIngress(
@@ -2228,6 +2237,8 @@ const memoryLanceDBProPlugin = {
           }
 
           const minMessages = config.extractMinMessages ?? 2;
+          const explicitRememberInTexts = texts.some((text) => hasExplicitRememberInstruction(text));
+          const effectiveMinMessages = explicitRememberInTexts ? 1 : minMessages;
           if (skippedAutoCaptureTexts > 0) {
             api.logger.debug(
               `memory-lancedb-pro: auto-capture skipped ${skippedAutoCaptureTexts} injected/system text block(s) for agent ${agentId}`,
@@ -2244,7 +2255,7 @@ const memoryLanceDBProPlugin = {
             );
           }
           api.logger.debug(
-            `memory-lancedb-pro: auto-capture collected ${texts.length} text(s) for agent ${agentId} (minMessages=${minMessages}, smartExtraction=${smartExtractor ? "on" : "off"})`,
+            `memory-lancedb-pro: auto-capture collected ${texts.length} text(s) for agent ${agentId} (minMessages=${effectiveMinMessages}, smartExtraction=${smartExtractor ? "on" : "off"})`,
           );
           if (texts.length === 0) {
             api.logger.debug(
@@ -2270,18 +2281,24 @@ const memoryLanceDBProPlugin = {
               );
               return;
             }
-            if (cleanTexts.length >= minMessages) {
+            if (cleanTexts.length >= effectiveMinMessages) {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${minMessages})`,
+                `memory-lancedb-pro: auto-capture running smart extraction for agent ${agentId} (${cleanTexts.length} clean texts >= ${effectiveMinMessages})`,
               );
               const conversationText = cleanTexts.join("\n");
               const stats = await smartExtractor.extractAndPersist(
                 conversationText, sessionKey,
                 { scope: defaultScope, scopeFilter: accessibleScopes },
               );
-              if (stats.created > 0 || stats.merged > 0 || (stats.rejected ?? 0) > 0) {
+              const handledBySmartExtraction =
+                stats.created > 0 ||
+                stats.merged > 0 ||
+                stats.skipped > 0 ||
+                (stats.supported ?? 0) > 0 ||
+                (stats.rejected ?? 0) > 0;
+              if (handledBySmartExtraction) {
                 api.logger.info(
-                  `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped, ${stats.rejected ?? 0} rejected for agent ${agentId}`
+                  `memory-lancedb-pro: smart-extracted ${stats.created} created, ${stats.merged} merged, ${stats.skipped} skipped, ${stats.supported ?? 0} supported, ${stats.rejected ?? 0} rejected for agent ${agentId}`
                 );
                 return; // Smart extraction handled everything
               }
@@ -2291,7 +2308,7 @@ const memoryLanceDBProPlugin = {
               );
             } else {
               api.logger.debug(
-                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${cleanTexts.length} < ${minMessages})`,
+                `memory-lancedb-pro: auto-capture skipped smart extraction for agent ${agentId} (${cleanTexts.length} < ${effectiveMinMessages})`,
               );
             }
           }
