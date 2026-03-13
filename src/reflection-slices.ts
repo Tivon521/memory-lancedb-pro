@@ -90,6 +90,28 @@ export function sanitizeReflectionSliceLines(lines: string[]): string[] {
     .filter((line) => !isPlaceholderReflectionSliceLine(line));
 }
 
+const INJECTABLE_REFLECTION_BLOCK_PATTERNS: RegExp[] = [
+  /\b(ignore|disregard|forget|override|bypass)\b[\s\S]{0,80}\b(previous|prior|above|earlier|system|developer|instructions?|guardrails?|policy)\b/i,
+  /\b(system prompt|developer prompt|hidden prompt|hidden instructions?|chain[- ]of[- ]thought|reasoning trace)\b/i,
+  /\b(reveal|print|dump|show)\b[\s\S]{0,80}\b(prompt|instructions?|secrets?|keys?|tokens?)\b/i,
+  /<(?:system|assistant|user|tool|developer|inherited-rules|derived-focus)>/i,
+  /^(?:system|assistant|user|developer|tool)\s*:/i,
+];
+
+export function isUnsafeInjectableReflectionLine(line: string): boolean {
+  const normalized = normalizeReflectionSliceLine(line);
+  if (!normalized) return true;
+  return INJECTABLE_REFLECTION_BLOCK_PATTERNS.some((pattern) =>
+    pattern.test(normalized),
+  );
+}
+
+export function sanitizeInjectableReflectionLines(lines: string[]): string[] {
+  return sanitizeReflectionSliceLines(lines).filter(
+    (line) => !isUnsafeInjectableReflectionLine(line),
+  );
+}
+
 function isInvariantRuleLike(line: string): boolean {
   return /^(always|never|when\b|if\b|before\b|after\b|prefer\b|avoid\b|require\b|only\b|do not\b|must\b|should\b)/i.test(line) ||
     /\b(must|should|never|always|prefer|avoid|required?)\b/i.test(line);
