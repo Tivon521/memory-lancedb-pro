@@ -789,9 +789,9 @@ export function registerMemoryForgetTool(
         try {
           const agentId = resolveRuntimeAgentId(runtimeContext.agentId, runtimeCtx);
           // Determine accessible scopes
-          let scopeFilter = resolveScopeFilter(context.scopeManager, agentId);
+          let scopeFilter = resolveScopeFilter(runtimeContext.scopeManager, agentId);
           if (scope) {
-            if (context.scopeManager.isAccessible(scope, agentId)) {
+            if (runtimeContext.scopeManager.isAccessible(scope, agentId)) {
               scopeFilter = [scope];
             } else {
               return {
