@@ -2031,6 +2031,85 @@ const memoryLanceDBProPlugin = {
     const mdMirror = createMdMirrorWriter(api, config);
 
     // ========================================================================
+    // Register Memory Runtime (OpenClaw active memory runtime bridge)
+    // ========================================================================
+
+    api.registerMemoryRuntime({
+      async getMemorySearchManager(params) {
+        const agentId = params.agentId?.trim() || "main";
+        const accessibleScopes = scopeManager.getAccessibleScopes(agentId);
+
+        const [stats, embedTest, retrievalTest] = await Promise.all([
+          store.stats(accessibleScopes),
+          embedder.test(),
+          retriever.test(),
+        ]);
+
+        const statusSnapshot = {
+          backend: "builtin" as const,
+          provider: config.embedding.provider || "openai-compatible",
+          model: config.embedding.model || "text-embedding-3-small",
+          requestedProvider: config.embedding.provider || "openai-compatible",
+          files: stats.totalCount,
+          chunks: stats.totalCount,
+          dirty: false,
+          dbPath: resolvedDbPath,
+          sources: ["memory"] as const,
+          sourceCounts: [
+            {
+              source: "memory" as const,
+              files: stats.totalCount,
+              chunks: stats.totalCount,
+            },
+          ],
+          cache: {
+            enabled: false,
+          },
+          fts: {
+            enabled: store.hasFtsSupport,
+            available: retrievalTest.hasFtsSupport,
+            error: store.lastFtsError || retrievalTest.error,
+          },
+          vector: {
+            enabled: true,
+            available: embedTest.success,
+            dims: config.embedding.dimensions || vectorDim,
+          },
+          custom: {
+            scopeCounts: stats.scopeCounts,
+            categoryCounts: stats.categoryCounts,
+            retrievalMode: retrievalTest.mode,
+            embeddingDimensions: embedTest.dimensions,
+          },
+        };
+
+        return {
+          manager: {
+            status() {
+              return statusSnapshot;
+            },
+            async probeEmbeddingAvailability() {
+              if (embedTest.success) return { ok: true };
+              return { ok: false, error: embedTest.error || "embedding probe failed" };
+            },
+            async probeVectorAvailability() {
+              return embedTest.success === true;
+            },
+            async close() {
+              return;
+            },
+          },
+        };
+      },
+      resolveMemoryBackendConfig() {
+        return { backend: "builtin" as const };
+      },
+      async closeAllMemorySearchManagers() {
+        return;
+      },
+    });
+
+    // ========================================================================
     // Register Tools
     // ========================================================================
 
